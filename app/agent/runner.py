@@ -152,7 +152,7 @@ def _model(settings: Settings, *, bind_tools: list | None = None):
     kwargs = {
         "api_key": settings.openai_api_key,
         "max_tokens": settings.research_model_max_tokens,
-        "extra_body": {"think": False},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
     }
     if settings.openai_base_url:
         kwargs["base_url"] = settings.openai_base_url

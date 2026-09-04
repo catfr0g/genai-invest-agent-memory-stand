@@ -8,6 +8,16 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _as_openai_compat_model(model_id: str) -> str:
+    """OpenRouter is an OpenAI-compatible endpoint (OPENAI_BASE_URL), not a LangChain provider.
+
+    `init_chat_model("openrouter:...")` looks for langchain-openrouter; rewrite to openai:.
+    """
+    if model_id.startswith("openrouter:"):
+        return "openai:" + model_id.removeprefix("openrouter:")
+    return model_id
+
+
 @lru_cache
 def get_settings() -> "Settings":
     return Settings()
@@ -37,8 +47,8 @@ class Settings:
     ui_client_secret: str = os.getenv("UI_CLIENT_SECRET", "streamlit-ui-secret")
     streamlit_app_client_id: str = os.getenv("STREAMLIT_APP_CLIENT_ID", "streamlit-app")
 
-    research_model: str = os.getenv("RESEARCH_MODEL", "openai:gpt-4o-mini")
-    summarization_model: str = os.getenv("SUMMARIZATION_MODEL", "openai:gpt-4o-mini")
+    research_model: str = _as_openai_compat_model(os.getenv("RESEARCH_MODEL", "openai:gpt-4o-mini"))
+    summarization_model: str = _as_openai_compat_model(os.getenv("SUMMARIZATION_MODEL", "openai:gpt-4o-mini"))
 
     working_memory_ttl: int = int(os.getenv("WORKING_MEMORY_TTL", "86400"))
 
