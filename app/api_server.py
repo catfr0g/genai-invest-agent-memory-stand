@@ -16,6 +16,7 @@ import json
 import time
 import urllib.parse
 import uuid
+from typing import Any, Literal
 
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -214,7 +215,22 @@ summary{{cursor:pointer}}
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list["TextContentPart | ImageContentPart"]
+
+
+class TextContentPart(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ImageUrl(BaseModel):
+    url: str
+    detail: Literal["auto", "low", "high"] | None = None
+
+
+class ImageContentPart(BaseModel):
+    type: Literal["image_url"]
+    image_url: ImageUrl
 
 
 class ChatCompletionRequest(BaseModel):
@@ -223,6 +239,7 @@ class ChatCompletionRequest(BaseModel):
     # Расширения поверх стандартной OpenAI-формы — необязательны, promptfoo может их не знать.
     session_id: str | None = None
     auth_mode: str = "vulnerable"  # "vulnerable" | "protected" — какой режим стенда тестируем
+    reasoning: bool = False
     stream: bool = False
 
 
@@ -370,20 +387,45 @@ async def chat_completions(
     if not user_messages:
         raise HTTPException(status_code=400, detail="В messages нужен хотя бы один message с role=user")
     query = user_messages[-1].content
+    if isinstance(query, str):
+        query_text = query
+        query_for_model = query
+        image_count = 0
+    else:
+        image_count = sum(isinstance(part, ImageContentPart) for part in query)
+        if image_count > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Поддерживается не более одного изображения",
+            )
+        query_text = "\n".join(
+            part.text for part in query if isinstance(part, TextContentPart)
+        )
+        query_for_model = [part.model_dump(exclude_none=True) for part in query]
     # session_id: явный из тела (curl/promptfoo) > X-Conversation-Id от LibreChat (librechat.yaml,
     # LIBRECHAT_BODY_CONVERSATIONID) > новый случайный — без второго варианта каждое сообщение
     # в LibreChat начинало бы новую сессию памяти, и рабочая память не накапливалась бы в диалоге.
     session_id = body.session_id or x_conversation_id or str(uuid.uuid4())[:8]
 
-    if query.strip().lower() == _FINALIZE_COMMAND:
+    assistant_reasoning: str | None = None
+    reasoning_tokens: int | None = None
+    if image_count == 0 and query_text.strip().lower() == _FINALIZE_COMMAND:
         # Ручная финализация текущей сессии прямо из чата — то же самое, что curl на
         # POST /v1/sessions/{id}/finalize, но доступно и тем, у кого нет доступа к терминалу
         # (LibreChat не даёт кастомных кнопок для custom endpoint).
         state = await finalize_session(user_id, session_id)
         final_report = _finalize_reply(state)
     else:
-        result = await run_research(user_id, session_id, query, auth_mode=body.auth_mode)
+        result = await run_research(
+            user_id,
+            session_id,
+            query_for_model,
+            auth_mode=body.auth_mode,
+            reasoning=body.reasoning,
+        )
         final_report = result["final_report"]
+        assistant_reasoning = result.get("reasoning")
+        reasoning_tokens = result.get("reasoning_tokens")
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -398,7 +440,11 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    return {
+    message: dict[str, Any] = {"role": "assistant", "content": final_report}
+    if body.reasoning:
+        message["reasoning"] = assistant_reasoning
+
+    payload: dict[str, Any] = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
@@ -406,11 +452,16 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": final_report},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
     }
+    if body.reasoning and reasoning_tokens is not None:
+        payload["usage"] = {
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}
+        }
+    return payload
 
 
 @app.post("/v1/sessions/{session_id}/finalize")

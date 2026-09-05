@@ -1,12 +1,16 @@
 """Лёгкий ReAct-агент: LLM + тулы MCP Инвеста / DuckDuckGo + многоуровневая память."""
 
+import json
 import time
 from typing import Any
 
 import httpx
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.output_parsers.openai_tools import make_invalid_tool_call, parse_tool_call
+from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from openai import AsyncOpenAI
 
 from app.agent.tools import duckduckgo_search
 from app.config import get_settings, Settings
@@ -46,6 +50,20 @@ SYSTEM_PROMPT = (
 )
 
 _agent_token_cache: dict[str, Any] = {}
+UserContent = str | list[dict[str, Any]]
+
+
+def _memory_text(query: UserContent) -> str:
+    if isinstance(query, str):
+        return query
+    parts = [
+        str(part.get("text", ""))
+        for part in query
+        if part.get("type") == "text" and part.get("text")
+    ]
+    if any(part.get("type") == "image_url" for part in query):
+        parts.append("[Изображение]")
+    return "\n".join(parts)
 
 
 def _token_endpoint(settings: Settings) -> str:
@@ -148,11 +166,151 @@ async def _load_tools(
     return tools
 
 
-def _model(settings: Settings, *, bind_tools: list | None = None):
+def _research_model_id(settings: Settings) -> str:
+    model = settings.research_model
+    return model.split(":", 1)[1] if ":" in model else model
+
+
+def _to_openai_messages(messages: list) -> list[dict[str, Any]]:
+    payload: list[dict[str, Any]] = []
+    for message in messages:
+        if isinstance(message, SystemMessage):
+            payload.append({"role": "system", "content": message.content})
+            continue
+        if isinstance(message, HumanMessage):
+            payload.append({"role": "user", "content": message.content})
+            continue
+        if isinstance(message, AIMessage):
+            item: dict[str, Any] = {
+                "role": "assistant",
+                "content": message.content or "",
+            }
+            if message.tool_calls:
+                item["tool_calls"] = [
+                    {
+                        "id": call["id"],
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": (
+                                call["args"]
+                                if isinstance(call["args"], str)
+                                else json.dumps(call["args"], ensure_ascii=False)
+                            ),
+                        },
+                    }
+                    for call in message.tool_calls
+                ]
+            payload.append(item)
+            continue
+        if isinstance(message, ToolMessage):
+            payload.append(
+                {
+                    "role": "tool",
+                    "content": message.content,
+                    "tool_call_id": message.tool_call_id,
+                }
+            )
+    return payload
+
+
+def _raw_reasoning_text(choice: dict[str, Any]) -> str | None:
+    for key in ("reasoning", "reasoning_content"):
+        value = choice.get(key)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
+def _aimessage_from_openai_choice(
+    choice: dict[str, Any],
+    *,
+    usage: dict[str, Any] | None,
+    model_name: str | None,
+    response_id: str | None,
+) -> AIMessage:
+    message = choice.get("message") or {}
+    additional_kwargs: dict[str, Any] = {}
+    reasoning_text = _raw_reasoning_text(message)
+    if reasoning_text:
+        additional_kwargs["reasoning"] = reasoning_text
+        additional_kwargs["reasoning_content"] = reasoning_text
+
+    tool_calls = []
+    invalid_tool_calls = []
+    for raw_tool_call in message.get("tool_calls") or []:
+        try:
+            tool_calls.append(parse_tool_call(raw_tool_call, return_id=True))
+        except Exception as exc:
+            invalid_tool_calls.append(make_invalid_tool_call(raw_tool_call, str(exc)))
+
+    return AIMessage(
+        content=message.get("content") or "",
+        additional_kwargs=additional_kwargs,
+        tool_calls=tool_calls,
+        invalid_tool_calls=invalid_tool_calls,
+        response_metadata={
+            "token_usage": usage or {},
+            "model_name": model_name,
+            "id": response_id,
+            "finish_reason": choice.get("finish_reason"),
+        },
+    )
+
+
+def _extract_reasoning(message: AIMessage) -> str | None:
+    extra = message.additional_kwargs or {}
+    for key in ("reasoning", "reasoning_content"):
+        value = extra.get(key)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+
+    meta = message.response_metadata or {}
+    for key in ("reasoning", "reasoning_content"):
+        value = meta.get(key)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+
+    content = message.content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("thinking", "reasoning"):
+                text = block.get("thinking") or block.get("text") or block.get("reasoning")
+                if text:
+                    parts.append(str(text))
+        if parts:
+            return "\n".join(parts).strip()
+
+    return None
+
+
+def _extract_reasoning_tokens(message: AIMessage) -> int | None:
+    meta = message.response_metadata or {}
+    usage = meta.get("token_usage") or meta.get("usage") or {}
+    details = usage.get("completion_tokens_details") or {}
+    tokens = details.get("reasoning_tokens")
+    return int(tokens) if tokens is not None else None
+
+
+def _model(
+    settings: Settings,
+    *,
+    bind_tools: list | None = None,
+    reasoning: bool = False,
+):
     kwargs = {
         "api_key": settings.openai_api_key,
         "max_tokens": settings.research_model_max_tokens,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": reasoning}},
     }
     if settings.openai_base_url:
         kwargs["base_url"] = settings.openai_base_url
@@ -160,11 +318,46 @@ def _model(settings: Settings, *, bind_tools: list | None = None):
     return model.bind_tools(bind_tools) if bind_tools else model
 
 
+async def _invoke_model(
+    settings: Settings,
+    messages: list,
+    *,
+    tools: list | None = None,
+    reasoning: bool = False,
+) -> AIMessage:
+    if not reasoning:
+        return await _model(settings, bind_tools=tools, reasoning=False).ainvoke(messages)
+
+    client = AsyncOpenAI(
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+    )
+    request: dict[str, Any] = {
+        "model": _research_model_id(settings),
+        "messages": _to_openai_messages(messages),
+        "max_tokens": settings.research_model_max_tokens,
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
+    }
+    if tools:
+        request["tools"] = [convert_to_openai_tool(tool) for tool in tools]
+
+    completion = await client.chat.completions.create(**request)
+    raw = completion.model_dump()
+    choice = raw["choices"][0]
+    return _aimessage_from_openai_choice(
+        choice,
+        usage=raw.get("usage"),
+        model_name=raw.get("model"),
+        response_id=raw.get("id"),
+    )
+
+
 async def run_research(
     user_id: str,
     session_id: str,
-    query: str,
+    query: UserContent,
     auth_mode: str = "vulnerable",
+    reasoning: bool = False,
     user_access_token: str | None = None,
 ) -> dict[str, Any]:
     """Ответить на вопрос, при необходимости вызывая тулы MCP Инвеста / веб-поиск.
@@ -197,11 +390,20 @@ async def run_research(
 
     max_steps = max(settings.max_react_tool_calls, 1)
     final_text = ""
+    final_reasoning: str | None = None
+    final_reasoning_tokens: int | None = None
     for _ in range(max_steps):
-        response: AIMessage = await _model(settings, bind_tools=tools).ainvoke(messages)
+        response: AIMessage = await _invoke_model(
+            settings,
+            messages,
+            tools=tools,
+            reasoning=reasoning,
+        )
         messages.append(response)
         if not response.tool_calls:
             final_text = str(response.content or "").strip()
+            final_reasoning = _extract_reasoning(response)
+            final_reasoning_tokens = _extract_reasoning_tokens(response)
             break
         for call in response.tool_calls:
             tool = tools_by_name.get(call["name"])
@@ -218,13 +420,24 @@ async def run_research(
             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
     if not final_text:
-        wrap_up = await _model(settings).ainvoke(
-            messages + [HumanMessage(content="Дай финальный ответ по уже собранным данным, без вызова тулов.")]
+        wrap_up = await _invoke_model(
+            settings,
+            messages + [HumanMessage(content="Дай финальный ответ по уже собранным данным, без вызова тулов.")],
+            reasoning=reasoning,
         )
         final_text = str(wrap_up.content or "").strip()
+        if final_reasoning is None:
+            final_reasoning = _extract_reasoning(wrap_up)
+        if final_reasoning_tokens is None:
+            final_reasoning_tokens = _extract_reasoning_tokens(wrap_up)
 
     if not final_text:
         final_text = "Модель не вернула текстовый ответ."
 
-    store.append_turn(user_id, session_id, query, final_text)
-    return {"final_report": final_text, "messages": messages}
+    store.append_turn(user_id, session_id, _memory_text(query), final_text)
+    return {
+        "final_report": final_text,
+        "reasoning": final_reasoning,
+        "reasoning_tokens": final_reasoning_tokens,
+        "messages": messages,
+    }
