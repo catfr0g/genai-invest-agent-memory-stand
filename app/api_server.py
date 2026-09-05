@@ -16,7 +16,7 @@ import json
 import time
 import urllib.parse
 import uuid
-from typing import Literal
+from typing import Any, Literal
 
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -407,6 +407,8 @@ async def chat_completions(
     # в LibreChat начинало бы новую сессию памяти, и рабочая память не накапливалась бы в диалоге.
     session_id = body.session_id or x_conversation_id or str(uuid.uuid4())[:8]
 
+    assistant_reasoning: str | None = None
+    reasoning_tokens: int | None = None
     if image_count == 0 and query_text.strip().lower() == _FINALIZE_COMMAND:
         # Ручная финализация текущей сессии прямо из чата — то же самое, что curl на
         # POST /v1/sessions/{id}/finalize, но доступно и тем, у кого нет доступа к терминалу
@@ -422,6 +424,8 @@ async def chat_completions(
             reasoning=body.reasoning,
         )
         final_report = result["final_report"]
+        assistant_reasoning = result.get("reasoning")
+        reasoning_tokens = result.get("reasoning_tokens")
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
@@ -436,7 +440,11 @@ async def chat_completions(
             media_type="text/event-stream",
         )
 
-    return {
+    message: dict[str, Any] = {"role": "assistant", "content": final_report}
+    if body.reasoning:
+        message["reasoning"] = assistant_reasoning
+
+    payload: dict[str, Any] = {
         "id": completion_id,
         "object": "chat.completion",
         "created": created,
@@ -444,11 +452,16 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": final_report},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
     }
+    if body.reasoning and reasoning_tokens is not None:
+        payload["usage"] = {
+            "completion_tokens_details": {"reasoning_tokens": reasoning_tokens}
+        }
+    return payload
 
 
 @app.post("/v1/sessions/{session_id}/finalize")
