@@ -4,6 +4,7 @@ from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collection import Collection
 
 from app.config import get_settings
+from app.memory.errors import MemoryResetError
 from app.memory.models import AgentPolicyMemory, ApiKey, DialogSession, EpisodicMemory, SemanticMemory
 
 
@@ -41,6 +42,22 @@ class MongoMemoryStore:
     @property
     def api_keys(self) -> "ApiKeyRepo":
         return ApiKeyRepo(self._db["api_keys"])
+
+    def clear_all(self) -> dict[str, int]:
+        """Удалить все записи памяти агента, сохранив коллекцию API-ключей."""
+        deleted: dict[str, int] = {}
+        collections = (
+            ("dialog_sessions", self.dialog.col),
+            ("episodic_memories", self.episodic.col),
+            ("semantic_memories", self.semantic.col),
+            ("agent_policy_memories", self.agent_policy.col),
+        )
+        for name, collection in collections:
+            try:
+                deleted[name] = int(collection.delete_many({}).deleted_count)
+            except Exception as exc:
+                raise MemoryResetError(deleted, name) from exc
+        return deleted
 
 
 class DialogRepo:

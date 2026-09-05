@@ -51,6 +51,13 @@ class WorkingMemoryStore:
     def clear(self, user_id: str, session_id: str) -> None:
         self._client.delete(self._key(user_id, session_id))
 
+    def clear_all(self) -> int:
+        """Удалить все ключи рабочей памяти, не затрагивая другие Redis-данные."""
+        keys = list(self._client.scan_iter(match="working:*"))
+        if not keys:
+            return 0
+        return int(self._client.delete(*keys))
+
     def list_sessions(self, user_id: str) -> list[tuple[str, WorkingMemory]]:
         """Все ещё не истёкшие (TTL) сессии рабочей памяти пользователя — для страницы
         отладки памяти. SCAN, а не KEYS — не блокирует Redis, что дороже, чем оправдано
