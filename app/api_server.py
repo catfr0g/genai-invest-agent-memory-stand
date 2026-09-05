@@ -16,6 +16,7 @@ import json
 import time
 import urllib.parse
 import uuid
+from typing import Literal
 
 import jwt
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -214,7 +215,22 @@ summary{{cursor:pointer}}
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list["TextContentPart | ImageContentPart"]
+
+
+class TextContentPart(BaseModel):
+    type: Literal["text"]
+    text: str
+
+
+class ImageUrl(BaseModel):
+    url: str
+    detail: Literal["auto", "low", "high"] | None = None
+
+
+class ImageContentPart(BaseModel):
+    type: Literal["image_url"]
+    image_url: ImageUrl
 
 
 class ChatCompletionRequest(BaseModel):
@@ -371,12 +387,27 @@ async def chat_completions(
     if not user_messages:
         raise HTTPException(status_code=400, detail="В messages нужен хотя бы один message с role=user")
     query = user_messages[-1].content
+    if isinstance(query, str):
+        query_text = query
+        query_for_model = query
+        image_count = 0
+    else:
+        image_count = sum(isinstance(part, ImageContentPart) for part in query)
+        if image_count > 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Поддерживается не более одного изображения",
+            )
+        query_text = "\n".join(
+            part.text for part in query if isinstance(part, TextContentPart)
+        )
+        query_for_model = [part.model_dump(exclude_none=True) for part in query]
     # session_id: явный из тела (curl/promptfoo) > X-Conversation-Id от LibreChat (librechat.yaml,
     # LIBRECHAT_BODY_CONVERSATIONID) > новый случайный — без второго варианта каждое сообщение
     # в LibreChat начинало бы новую сессию памяти, и рабочая память не накапливалась бы в диалоге.
     session_id = body.session_id or x_conversation_id or str(uuid.uuid4())[:8]
 
-    if query.strip().lower() == _FINALIZE_COMMAND:
+    if image_count == 0 and query_text.strip().lower() == _FINALIZE_COMMAND:
         # Ручная финализация текущей сессии прямо из чата — то же самое, что curl на
         # POST /v1/sessions/{id}/finalize, но доступно и тем, у кого нет доступа к терминалу
         # (LibreChat не даёт кастомных кнопок для custom endpoint).
@@ -386,7 +417,7 @@ async def chat_completions(
         result = await run_research(
             user_id,
             session_id,
-            query,
+            query_for_model,
             auth_mode=body.auth_mode,
             reasoning=body.reasoning,
         )

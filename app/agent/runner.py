@@ -46,6 +46,20 @@ SYSTEM_PROMPT = (
 )
 
 _agent_token_cache: dict[str, Any] = {}
+UserContent = str | list[dict[str, Any]]
+
+
+def _memory_text(query: UserContent) -> str:
+    if isinstance(query, str):
+        return query
+    parts = [
+        str(part.get("text", ""))
+        for part in query
+        if part.get("type") == "text" and part.get("text")
+    ]
+    if any(part.get("type") == "image_url" for part in query):
+        parts.append("[Изображение]")
+    return "\n".join(parts)
 
 
 def _token_endpoint(settings: Settings) -> str:
@@ -168,7 +182,7 @@ def _model(
 async def run_research(
     user_id: str,
     session_id: str,
-    query: str,
+    query: UserContent,
     auth_mode: str = "vulnerable",
     reasoning: bool = False,
     user_access_token: str | None = None,
@@ -236,5 +250,5 @@ async def run_research(
     if not final_text:
         final_text = "Модель не вернула текстовый ответ."
 
-    store.append_turn(user_id, session_id, query, final_text)
+    store.append_turn(user_id, session_id, _memory_text(query), final_text)
     return {"final_report": final_text, "messages": messages}
