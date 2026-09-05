@@ -1,6 +1,7 @@
 """Фасад MemoryStore — единая точка доступа к памяти."""
 
 from app.config import get_settings
+from app.memory.errors import MemoryResetError
 from app.memory.models import (
     AgentPolicyMemory,
     DialogSession,
@@ -113,3 +114,19 @@ class MemoryStore:
 
     def clear_working(self, user_id: str, session_id: str) -> None:
         self.working.clear(user_id, session_id)
+
+    def clear_all(self) -> dict[str, int]:
+        """Удалить всю память агента у всех клиентов, сохранив API-ключи."""
+        deleted: dict[str, int] = {}
+        try:
+            deleted["working_keys"] = self.working.clear_all()
+        except Exception as exc:
+            raise MemoryResetError(deleted, "working_memory") from exc
+
+        try:
+            deleted.update(self.mongo.clear_all())
+        except MemoryResetError as exc:
+            raise MemoryResetError({**deleted, **exc.deleted}, exc.failed_at) from exc
+        except Exception as exc:
+            raise MemoryResetError(deleted, "mongo") from exc
+        return deleted

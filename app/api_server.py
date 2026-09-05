@@ -26,13 +26,14 @@ from pydantic import BaseModel
 from app.agent.runner import run_research
 from app.apikeys import generate_key, hash_key
 from app.config import get_settings
-from app.memory.mongo import MongoMemoryStore
-from app.memory.working import WorkingMemoryStore
+from app.memory.errors import MemoryResetError
+from app.memory.store import MemoryStore
 from app.orchestrator.graph import finalize_session
 
 app = FastAPI(title="genai-stand agent API")
-_mongo = MongoMemoryStore()
-_working = WorkingMemoryStore()
+_memory = MemoryStore()
+_mongo = _memory.mongo
+_working = _memory.working
 _settings = get_settings()
 _jwk_client: PyJWKClient | None = None
 
@@ -238,6 +239,35 @@ def _resolve_user(authorization: str | None) -> str:
 @app.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/v1/memory/reset")
+def reset_memory(authorization: str | None = Header(default=None)) -> dict:
+    """Глобально очистить память агента перед новым последовательным тестовым run."""
+    _resolve_user(authorization)
+    try:
+        deleted = _memory.clear_all()
+    except MemoryResetError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "reset_failed",
+                "message": "Reset неполный; повторите его до начала тестового run.",
+                "failed_at": exc.failed_at,
+                "deleted": exc.deleted,
+            },
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "reset_failed",
+                "message": "Reset не выполнен; повторите его до начала тестового run.",
+                "failed_at": "unknown",
+                "deleted": {},
+            },
+        ) from exc
+    return {"status": "reset", "deleted": deleted}
 
 
 @app.get("/", response_class=HTMLResponse)
