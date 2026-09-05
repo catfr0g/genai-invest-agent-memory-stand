@@ -148,11 +148,16 @@ async def _load_tools(
     return tools
 
 
-def _model(settings: Settings, *, bind_tools: list | None = None):
+def _model(
+    settings: Settings,
+    *,
+    bind_tools: list | None = None,
+    reasoning: bool = False,
+):
     kwargs = {
         "api_key": settings.openai_api_key,
         "max_tokens": settings.research_model_max_tokens,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": reasoning}},
     }
     if settings.openai_base_url:
         kwargs["base_url"] = settings.openai_base_url
@@ -165,6 +170,7 @@ async def run_research(
     session_id: str,
     query: str,
     auth_mode: str = "vulnerable",
+    reasoning: bool = False,
     user_access_token: str | None = None,
 ) -> dict[str, Any]:
     """Ответить на вопрос, при необходимости вызывая тулы MCP Инвеста / веб-поиск.
@@ -198,7 +204,11 @@ async def run_research(
     max_steps = max(settings.max_react_tool_calls, 1)
     final_text = ""
     for _ in range(max_steps):
-        response: AIMessage = await _model(settings, bind_tools=tools).ainvoke(messages)
+        response: AIMessage = await _model(
+            settings,
+            bind_tools=tools,
+            reasoning=reasoning,
+        ).ainvoke(messages)
         messages.append(response)
         if not response.tool_calls:
             final_text = str(response.content or "").strip()
@@ -218,7 +228,7 @@ async def run_research(
             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
     if not final_text:
-        wrap_up = await _model(settings).ainvoke(
+        wrap_up = await _model(settings, reasoning=reasoning).ainvoke(
             messages + [HumanMessage(content="Дай финальный ответ по уже собранным данным, без вызова тулов.")]
         )
         final_text = str(wrap_up.content or "").strip()

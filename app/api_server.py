@@ -223,6 +223,7 @@ class ChatCompletionRequest(BaseModel):
     # Расширения поверх стандартной OpenAI-формы — необязательны, promptfoo может их не знать.
     session_id: str | None = None
     auth_mode: str = "vulnerable"  # "vulnerable" | "protected" — какой режим стенда тестируем
+    reasoning: bool = False
     stream: bool = False
 
 
@@ -382,7 +383,13 @@ async def chat_completions(
         state = await finalize_session(user_id, session_id)
         final_report = _finalize_reply(state)
     else:
-        result = await run_research(user_id, session_id, query, auth_mode=body.auth_mode)
+        result = await run_research(
+            user_id,
+            session_id,
+            query,
+            auth_mode=body.auth_mode,
+            reasoning=body.reasoning,
+        )
         final_report = result["final_report"]
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
